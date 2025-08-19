@@ -1,0 +1,165 @@
+clc, clear all;
+%% --- parameter ---
+N        = 128;          % NUM_Subcarriers
+L        = 10;           % channel length
+cp_len   = L-1;          % CP length
+num_sym  = 100;          % NUM_OFDM symbol
+M        = 4;            % QPSK modulation order
+EbN0_dB  = -20:25;       % Eb/N0 (dB)
+osf      = 4*10^9;            % over sampling rate(for RF simulation)
+
+NUM_ITER = 10;
+ber_1 = zeros(length(EbN0_dB), NUM_ITER);
+eq_RX_1 = zeros(N, num_sym);
+ber_2 = zeros(length(EbN0_dB), NUM_ITER);
+eq_RX_2 = zeros(N, num_sym);
+
+%% Mutipath LTI channel(no doppler influences)
+%h = [0.9+0j, 0.5+0.3j, 0.2+0.1j];
+for iter =  1:NUM_ITER
+h = randn(1,L);          % Each iteration offer a random L- tap channel realization 
+%h = [0.9, 0.5, 0.2];
+%% time domain channel matrix(for vectorized signal)
+G = zeros(N, N);
+g = [h(:) ; zeros(N-length(h),1)]; 
+%{
+for i = 1:N
+G(:, i) = circshift(g,i-1); % time domain channel matrix
+end
+
+%% frequency domain channel matrix(for vectorized signal)
+G_F = fft(G);             % frequency domain channel matrix
+%}
+G_F_2 = fft(g);
+%% --- 1. Bits → QPSK Baseband  ---
+bits      = randi([0 1], num_sym*N*log2(M),1);
+bb_sym    = QPSK_mod(bits);
+ofdm_grid = reshape(bb_sym, N, num_sym);
+
+%% --- 2. IFFT + CP → time-domain baseband ---
+tx_ifft = ifft(ofdm_grid, N, 1);          % N×num_sym
+tx_cp   = [tx_ifft(end-cp_len+1:end,:); tx_ifft];
+tx_bb   = tx_cp(:);                       % (N+cp_len)*num_sym
+
+%% --- 3. Baseband → RF upconversion ---
+% oversampling
+%{
+tx_bb_os = interp(tx_bb, osf);            
+fs        = 1 * osf;                      % RF sampling fs
+f_carrier = 0.2 * fs;                     % 載頻 (0.2×fs)
+
+t = (0:length(tx_bb_os)-1)'/fs;
+% IQ modulation
+
+tx_rf = real(tx_bb_os).*cos(2*pi*f_carrier*t) - ...
+        imag(tx_bb_os).*sin(2*pi*f_carrier*t);
+%}
+%% --- 4. Channel response and AWGN added---
+y = conv(tx_bb, h);
+for inx = 1:length(EbN0_dB)
+SNR_dB = EbN0_dB(inx) + 10*log10(log2(M));
+SNR = 10^(SNR_dB/10);
+Noise_Var = (1/SNR);
+noise = sqrt(Noise_Var/2)*(randn(size(y)) + 1j*randn(size(y)));
+rx_bb = y + noise;
+
+%% --- 5. Coherent Receiver down convert to Baseband ---
+%{
+rI = rx_rf .* cos(2*pi*f_carrier*t);
+rQ = -rx_rf .* sin(2*pi*f_carrier*t);
+
+% LPF ( Replace by decimation )
+rI_bb = decimate(rI, osf);
+rQ_bb = decimate(rQ, osf);
+
+rx_bb = rI_bb + 1j*rQ_bb;                 % reconstruct baseband signal
+%}
+%% --- 6. OFDM RX: remove CP / FFT / Equalize ---
+rx_truncate = rx_bb(1:(end-cp_len)); %truncate the unecessary impulse response vectors
+rx_mat = reshape(rx_truncate, N+cp_len, num_sym);
+rx_noCP = rx_mat(cp_len+1:end, :);        % CP removal
+RX    = fft(rx_noCP, N, 1);               % N×num_sym
+
+% frquency domain equalization
+for i= 1:num_sym
+eq_RX_1(:,i) = RX(:,i) ./ (G_F_2);
+end
+
+for i= 1:num_sym
+eq_RX_2(:,i) = (conj(G_F_2).*RX(:,i) ) ./ (conj(G_F_2).*(G_F_2) + Noise_Var);
+end
+%% --- 7. Demodulation & BER counting ---
+%% method 1
+rx_sym_1  = eq_RX_1(:);                     
+rx_bits_1 = QPSK_demod(rx_sym_1);
+rx_bits_1 = rx_bits_1(:);
+
+ber_1(inx,iter) = mean(rx_bits_1~=bits);
+%% method2
+rx_sym_2  = eq_RX_2(:);                     
+rx_bits_2 = QPSK_demod(rx_sym_2);
+rx_bits_2 = rx_bits_2(:);
+
+ber_2(inx,iter) = mean(rx_bits_2~=bits);
+
+end
+if mod(iter,100000) == 0
+   
+    fprintf("iter = %d \n", iter)
+    iter_BER_1 = zeros(length(EbN0_dB), 1);
+    iter_BER_2 = zeros(length(EbN0_dB), 1);
+    fprintf("Method 1:\n");
+    for i = 1:length(EbN0_dB)
+    iter_BER_1(i) = sum(ber_1(i,:))/iter;
+    fprintf("E_b/N_0 = %d\n", EbN0_dB(i));
+    fprintf('Iterative BER : %.2e\n', iter_BER_1(i));
+    end
+    fprintf("Method 2:\n");
+    for i = 1:length(EbN0_dB)
+    iter_BER_2(i) = sum(ber_2(i,:))/iter;
+
+    fprintf("E_b/N_0 = %d\n", EbN0_dB(i));
+    fprintf('Iterative BER : %.2e\n', iter_BER_2(i));
+    end
+end
+end
+
+mean_BER_1 = zeros(length(EbN0_dB),1);
+mean_BER_2 = zeros(length(EbN0_dB),1);
+for j = 1:length(EbN0_dB)
+mean_BER_1(j) = sum(ber_1(j,:))/NUM_ITER;
+end
+for j = 1:length(EbN0_dB)
+mean_BER_2(j) = sum(ber_2(j,:))/NUM_ITER;
+end
+
+figure(1);
+scatter(real(rx_bb), imag(rx_bb), 10, 'filled');
+title('Received time domain Symbol Constellation');
+xlabel('I'); ylabel('Q'); axis equal; grid on;
+
+figure(2);
+scatter(real(RX), imag(RX), 10, 'filled');
+title('Received frequency domain Symbol Constellation');
+xlabel('I'); ylabel('Q'); axis equal; grid on;
+
+figure(3);
+scatter(real(rx_sym_1), imag(rx_sym_1), 10, 'filled');
+title('Method1 Equalized frequency domain Symbol Constellation');
+xlabel('I'); ylabel('Q'); axis equal; grid on;
+
+figure(4);
+scatter(real(rx_sym_2), imag(rx_sym_2), 10, 'filled');
+title('Method2 Equalized frequency domain Symbol Constellation');
+xlabel('I'); ylabel('Q'); axis equal; grid on;
+
+
+figure(5);
+hold on;
+semilogy(EbN0_dB, mean_BER_1)
+semilogy(EbN0_dB, mean_BER_2)
+xlabel("E_b/N_0");
+ylabel("BER");
+title('Comparison of 2 method: E_b/N_0 to BER');
+hold off
+
